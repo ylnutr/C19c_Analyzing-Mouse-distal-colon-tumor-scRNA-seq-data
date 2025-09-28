@@ -1,0 +1,258 @@
+---
+title: "03.C19c_Doublet detection"
+author: "Yujin L"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 0. Background and Information
+
+This is continued from 02.C19c_Clustering.Rmd. Refer to 01.C19c_preprocessing.Rmd for experimental design and information and 02.C19c_Clustering for the prior analysis.
+
+## 0-1. Duoblet detection
+
+Doublets are artifacts that occur when two cells are captured together and sequenced as one. This means that in your matrix, for a given cell barcode, you are getting gene expression data from 2 different cells. These doublets can really confound your downstream analysis, so it is important to identify them during the preprocessing steps and remove them.
+
+There are two major types of doublets: heterotypic and homotypic. Heterotypic doublets are formed by cells with distinct transcriptional profiles. Homotypic doublets are formed by cells with similar transcriptional profiles. Heterotypic doublets are relatively easier to detect compared with homotypic doublets.
+
+Depending on the protocols used to barcode single cells/nuclei, doublet rates vary significantly and it can reach as high as 40%. Experimental strategies have been developed to reduce the doublet rate, such as cell hashing, and MULTI-Seq. However, these techniques require extra steps in sample preparation which leads to extra costs and time, and they do not guarantee to remove all doublets.
+
+As a result, removing doublets in silico is very appealing and there have been many tools/methods developed to achieve this. 
+
+`scDblFinder` takes fully pre-processed data from Seurat (NormalizeData, FindVariableGenes, ScaleData, RunPCA and RunUMAP) as input and the process should be done for each sample individually. The input data should be processed to remove low-quality cell clusters first.
+
+We are going to run scDblFinder on all the samples. 
+
+# 1. Set up workspace
+
+## 1-1. Set working directory
+
+In this step, we verify and update the working directory to ensure that all subsequent file operations (e.g., reading or writing data) are performed in the correct project folder. This is particularly important for maintaining reproducibility and avoiding file path errors. The directory is set to the folder containing the results of the functional annotation analysis for spatial transcriptomics clusters.
+  
+```{r setwd, echo=TRUE, warning=TRUE}
+getwd()
+setwd("/stor/work/Fleet/C19_Projects/C19c_10X_scRNA-seq_Project/04.Analysis in R/02.Doublet detection/")
+getwd()
+```
+  
+## 1-2. Load packages
+
+* Besides Seurat, we need to import some useful packages.
+
+* dplyr and ggplot2 are part of tidyverse, a readable and flexible R language for solving data science challenges. I personally prefer the coding style with tidyverse, but you may use base R too. patchwork combines separate ggplots into the same graphic with easy access to control layouts. limma is a Bioconductor package to analyze microarray data. It is not essential for our analysis, but may provide a more efficient implementation of the Wilcoxon rank sum test in differential expression analysis.
+
+```{r loadpackage, echo = TRUE, warning = TRUE}
+library(Seurat)
+library(SingleCellExperiment)
+library(scDblFinder)
+library(tidyverse)
+library(dplyr) # data manipulation
+library(ggplot2)
+```
+
+##  1-3. Load data
+
+```{r loaddata, echo = TRUE, warning = TRUE}
+rm(list = ls(all.names = TRUE)) # will clear all objects including hidden objects
+gc() # free up memory and report the memory usage
+options(max.print = .Machine$integer.max, scipen = 999, stringsAsFactors = F, dplyr.summarise.inform = F) # avoid truncated output in R console and scientific notation
+C19c_3000 <- readRDS("C19c_3000.rds")
+C19c_3000
+set.seed(12378)
+```
+
+# 2. Doublet detection
+
+The `findDoubletClusters()` function from the scDblFinder package identifies clusters with expression profiles lying between two other clusters (Bach et al. 2017). We consider every possible triplet of clusters consisting of a query cluster and two putative “source” clusters. Under the null hypothesis that the query consists of doublets from the two sources, we compute the number of genes (`num.de`) that are differentially expressed in the same direction in the query cluster compared to both of the source clusters. Such genes would be unique markers for the query cluster and provide evidence against the null hypothesis. For each query cluster, the best pair of putative sources is identified based on the lowest `num.de`. Clusters are then ranked by `num.de` where those with the few unique genes are more likely to be composed of doublets.
+
+## 2-1. Set the relevant paths
+
+I have a project path (a folder called “01.preprocessing”), which will be my input path. I create an out_path called Doublet_detection, where I will output all my plots and tables from this analysis.
+
+```{r paths, echo=TRUE, warning=TRUE}
+project_path <- "./"
+doublet_folder <- file.path(project_path, './Doublet_detection results') # subfolder for Doublet detection results
+```
+
+Let’s have a look at the metadata – as you can see there’s 10 samples in this Seurat object. This is important because most doublet detection tools work on a per-sample basis, meaning that if your Seurat object has more than 1 sample, you need to split it per sample, find doublets in each subset, and then merge the datasets again. 
+
+```{r Recap, echo=TRUE, warning=TRUE}
+head(C19c_3000@meta.data)
+table(C19c_3000$orig.ident)
+```
+
+`scDblFinder` takes a `SingleCellExperiment` object as input. If you already have your scRNAseq data in this format, you can just skip the next step and go directly to running `scDblFinder`; otherwise, we need to transform the Seurat object to `SingleCellExperiment` class.
+
+```{r sceobject, echo=TRUE, warning=TRUE}
+sce_3000 <- as.SingleCellExperiment(C19c_3000)
+```
+
+Next, we will run scDblFinder. We can do this really easily by just using the function `scDblFinder()`. The `samples` parameter is used to specify the metadata column with the sample IDs, if you have more than one sample. You can also finetune the expected multiplet rate with the parameter `dbr` and `dbr.sd`. Check out scDblFinder’s github page to find out more or run `?scDblFinder`.
+
+```{r rundoublet, echo=TRUE, warning=TRUE}
+sce_3000 <- scDblFinder(sce_3000, samples = "orig.ident") #dbr = multiplet_rate
+# For 10x data, it is usually safe to leave the `dbr` empty, and it will be automatically estimated.
+table(sce_3000$scDblFinder.class)
+sce_3000@colData@listData %>% as.data.frame() %>% head()
+```
+## 2-2. Summary of doublet detection results
+
+Let’s have a look at how many doublets and singlets we found. The labels will be stored in the metadata column called “scDblFinder.class”.
+
+If we take a look at the metadata, we see scDblFinder outputs 5 columns, which are prefixed by “scDblFinder”. Let’s extract these columns into a separate dataframe. We have:
+
+* **scDblFinder.sample:** the sample IDs
+
+* **scDblFinder.class:** the labels (singlet or doublet)
+
+* **scDblFinder.score:** the final doublet score (the higher the more likely that the cell is a doublet). I won’t go into the details of their method, but have a look at their documentation because you can finetune the threshold to call a doublet based on the expected number of doublets. I went with the default this time.
+
+* **scDblFinder.weighted:** score based on the proportion of the KNN that are doublets, weighted by their distance (useful for isolated cells)
+* **scDblFinder.cxds_score:** score based on an estimate of the difficultly of detecting artificial doublets in the cell’s neighborhood, a variant of the cxds score from the scds.
+
+```{r makedoubletmeta, echo=TRUE, warning=TRUE}
+# Explore results and add to seurat object
+meta_scdblfinder <- sce_3000@colData@listData %>% as.data.frame() %>% 
+  dplyr::select(starts_with('scDblFinder')) # 'scDblFinder.class')
+head(meta_scdblfinder)
+```
+
+```{r doubletbar, echo=TRUE, warning=TRUE}
+plot_data <- meta_scdblfinder %>%
+  group_by(scDblFinder.sample, scDblFinder.class) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(scDblFinder.sample) %>%
+  mutate(percent = n / sum(n) * 100)
+
+# 3. Create the grouped bar plot
+DBplot <- ggplot(plot_data, aes(x = scDblFinder.sample, y = percent, fill = scDblFinder.class)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  # Optional: Add text labels on top of the bars
+  # geom_text(aes(label=round(percent, 1)), vjust=-0.5, position=position_dodge(0.9), size=3) +
+  labs(
+    title = "Doublet Rate Distribution by Sample",
+    x = "Sample",
+    y = "Percentage of Cells (%)",
+    fill = "Cell Capture Type"
+  ) +
+  theme_classic() +
+  # Rotate x-axis labels for better readability if they overlap
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+DBplot
+png(filename = "./Doublet_detection results/doublet_barplot.png", height = 1500, width = 3000, res = 300)
+print(DBplot)
+dev.off()
+```
+![Violin plot of doublet rates split by sample](./Doublet_detection results/doublet_barplot.png)
+
+## 2-3. Add scDblFinder results to Seurat object
+
+Now,we need to add the doublet labels to the original Seurat object. So we first extract the metadata, then we make sure that the dataframe’s rows are the same as the ones in the Seurat object – add the cellIDs as rownames.
+
+And now we can add the metadata with the function AddMetaData(). I’m just going to add the scDblFinderclass, but you can add the other columns as well by removing this part. Feel free to customise the name of the column.
+
+```{r adddoubletmeta, echo=TRUE, warning=TRUE}
+# Explore results and add to seurat object
+meta_scdblfinder <- sce_3000@colData@listData %>% as.data.frame() %>% 
+  dplyr::select(starts_with('scDblFinder')) # 'scDblFinder.class')
+head(meta_scdblfinder)
+rownames(meta_scdblfinder) <- sce_3000@colData@rownames
+head(meta_scdblfinder)
+C19c_DBdetected <- AddMetaData(object = C19c_3000, metadata = meta_scdblfinder %>% dplyr::select('scDblFinder.class'))
+```
+Just to make sure, let’s check again the number of singlets and doublets.
+
+We can also now remove the temporary variables `meta_scdblfinder` and `sce_3000` from the environment to clear up a bit of memory.
+
+And now you can visualise some stats.
+
+```{r checkdoublet, echo=TRUE, warning=TRUE}
+head(C19c_DBdetected@meta.data)
+table(C19c_DBdetected$scDblFinder.class)
+rm(list = c('meta_scdblfinder', 'sce_3000'))
+```
+## 2-4. scDblFinder QC stats and summary table
+
+For example, le’ts plots violin plots of quality control metrics (number of RNA features, RNA counts, mitochondrial percentage, ribosomal percentage, hemoglobin percentage) split by `scDblFinder` class and grouped by `SampleID`. As you can see doublets tend to have a higher number of genes and read counts, but we don’t expect big differences in the mitochondrial percentage or ribosomal percentage.
+
+```{r stats, echo=TRUE, warning=TRUE}
+# Doublet stats
+# Check how doublets singlets differ in QC measures per sample.
+plotDB <- VlnPlot(C19c_DBdetected, group.by = 'orig.ident', 
+                  split.by = "scDblFinder.class",
+                  features = c("nFeature_RNA", "nCount_RNA", "percent.mito"),
+                  raster = FALSE, ncol = 1, pt.size = 0) + 
+  theme(legend.position = 'right')
+plotDB
+png(filename = "./Doublet_detection results/doubletQC_vlnplot.png", height = 4000, width = 6000, res = 300)
+print(plotDB)
+dev.off()
+```
+![Violin plot of doublet rates split by sample](./Doublet_detection results/doubletQC_vlnplot.png)
+Let's also view where doublets are in UMAP.
+
+```{r doubletUMAP, echo=TRUE, warning=TRUE}
+umap_doublet <- DimPlot(C19c_DBdetected, reduction = "umap", 
+                        group.by = "scDblFinder.class",
+                        label = TRUE, label.size = 6,
+                        pt.size = 0.2, raster = FALSE)
+umap_doublet
+png(filename = "./Doublet_detection results/doubletQC_UMAP.png", height = 3000, width = 4000, res = 300)
+print(umap_doublet)
+dev.off()
+umapdoublet_split <- DimPlot(C19c_DBdetected, reduction = "umap", 
+                            group.by = "scDblFinder.class",
+                            split.by = "orig.ident", label = FALSE, 
+                            label.size = 6,
+                            pt.size = 0.5, ncol = 3,  raster = FALSE)
+umapdoublet_split
+png(filename = "./Doublet_detection results/doubletQC_UMAP_split.png", height = 8000, width = 7000, res = 300)
+print(umapdoublet_split)
+dev.off()
+```
+![UMAP plot of doublet rates projected on entire data](./Doublet_detection results/doubletQC_UMAP.png)
+
+![UMAP plot of doublet rates split by sample](./Doublet_detection results/doubletQC_UMAP_split.png)
+
+We can also create a nice summary table by grouping the metadata by `SampleID` and `scDblFinder.class` and calculating the total count of cells in each group and the percentage of doublets and singlets for each sample.
+
+And we will save this summary table to a text file.
+
+```{r summarytable, echo=TRUE, warning=TRUE}
+doublets_summary <- C19c_DBdetected@meta.data %>% 
+  group_by(orig.ident, scDblFinder.class) %>% 
+  summarise(total_count = n(),.groups = 'drop') %>% as.data.frame() %>% ungroup() %>%
+  group_by(orig.ident) %>%
+  mutate(countT = sum(total_count)) %>%
+  group_by(scDblFinder.class, .add = TRUE) %>%
+  mutate(percent = paste0(round(100 * total_count/countT, 2),'%')) %>%
+  dplyr::select(-countT)
+doublets_summary
+write.table(doublets_summary, file = file.path(paste0('./Doublet_detection results/scDblFinder_doublets_summary.txt')), quote = FALSE, row.names = FALSE, sep = '\t')
+```
+# 3. Remove doublets
+
+You can remove cells marked as “doublet” very easily with the function subset().
+
+```{r rmdoublet, echo=TRUE, warning=TRUE}
+C19c_singlet <- subset(C19c_DBdetected, scDblFinder.class == 'singlet')
+print(paste("Filter out", ncol(C19c_DBdetected) - ncol(C19c_singlet), 
+            "samples because of the doublet QC metrics, with", ncol(C19c_singlet), "samples left."))
+C19c_singlet
+```
+# 4. Prepare for the next section
+
+In the next session, we will use the preprocessed data from this session to decide on the optimal number of clusters and cell types.
+
+```{r saveobj, echo=TRUE, warning=TRUE}
+saveRDS(C19c_DBdetected, file = "C19c_DBdetected.rds")
+saveRDS(C19c_singlet, file = "C19c_singlet.rds")
+```
+
+```{r sessioninfo, echo=TRUE, warning=TRUE}
+sessionInfo()
+```

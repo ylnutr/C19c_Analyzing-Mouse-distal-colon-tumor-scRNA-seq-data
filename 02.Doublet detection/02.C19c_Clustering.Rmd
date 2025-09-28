@@ -1,0 +1,327 @@
+---
+title: "02.C19c_Clustering"
+author: "Yujin L"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 0. Background and Information
+
+This is continued from 01.C19c_preprocessing.Rmd. Refer to 01.C19c_preprocessing.Rmd for experimental design and information.
+
+# 1. Set up workspace
+
+## 1-1. Set working directory
+
+In this step, we verify and update the working directory to ensure that all subsequent file operations (e.g., reading or writing data) are performed in the correct project folder. This is particularly important for maintaining reproducibility and avoiding file path errors. The directory is set to the folder containing the results of the functional annotation analysis for spatial transcriptomics clusters.
+  
+```{r setwd, echo=TRUE, warning=TRUE}
+getwd()
+setwd("/stor/work/Fleet/C19_Projects/C19c_10X_scRNA-seq_Project/04.Analysis in R/02.Doublet detection/")
+getwd()
+```
+  
+## 1-2. Load packages
+
+* Besides Seurat, we need to import some useful packages.
+
+* dplyr and ggplot2 are part of tidyverse, a readable and flexible R language for solving data science challenges. I personally prefer the coding style with tidyverse, but you may use base R too. patchwork combines separate ggplots into the same graphic with easy access to control layouts. limma is a Bioconductor package to analyze microarray data. It is not essential for our analysis, but may provide a more efficient implementation of the Wilcoxon rank sum test in differential expression analysis.
+
+```{r loadpackage, echo = TRUE, warning = TRUE}
+library(Seurat)
+library(kableExtra)
+library(biomaRt)
+library(dplyr) # data manipulation
+library(ggplot2)
+library(patchwork)
+library(clustree)
+library(scran)
+library(viridis)
+options(ggrepel.max.overlaps = Inf)
+```
+
+##  1-3. Load data
+
+```{r loaddata, echo = TRUE, warning = TRUE}
+C19c_subset <- readRDS("C19c_subset.rds")
+C19c_subset
+C19c_subset <- JoinLayers(C19c_subset)
+C19c_subset
+set.seed(12345)
+```
+
+# 3. Clustering workflow
+
+## 3-1. Normalization
+
+After filtering, the next step is to normalize the data. We employ a global-scaling normalization method, LogNormalize, that normalizes the gene expression measurements for each cell by the total expression, multiplies this by a scale factor (10,000 by default), and then log-transforms the data.
+
+```{r normalize, echo=TRUE, warning=TRUE}
+?NormalizeData
+C19c_norm <- NormalizeData(C19c_subset, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+
+```{r cehckstats, echo=TRUE, warning=TRUE}
+# Doublet stats
+# Check how doublets singlets differ in QC measures per sample.
+plot_v1 <- VlnPlot(C19c_subset, group.by = 'orig.ident', 
+                  features = c("nFeature_RNA", "nCount_RNA", "percent.mito"),
+                  raster = FALSE,ncol = 1, pt.size = 0) + theme(legend.position = 'right')
+plot_v1
+
+png(filename = "./Plots/vlnplot_C19c_subset.png", height = 4000, width = 4000, res = 300)
+print(plot_v1)
+dev.off()
+
+plot_v2 <- VlnPlot(C19c_norm, group.by = 'orig.ident', 
+                  features = c("nFeature_RNA", "nCount_RNA", "percent.mito"),
+                  raster = FALSE,ncol = 1, pt.size = 0) + theme(legend.position = 'right')
+plot_v2
+
+png(filename = "./Plots/vlnplot_C19c_norm.png", height = 4000, width = 4000, res = 300)
+print(plot_v2)
+dev.off()
+```
+![Before Normalization](./Plots/vlnplot_C19c_subset.png)
+![After Normalization](./Plots/vlnplot_C19c_norm.png)
+## 3-2. Cell cycle assignment
+
+Cell cycle phase can be a significant source of variation in single cell and single nucleus experiments. There are a number of automated cell cycle stage detection methods available for single cell data. For this workshop, we will be using the built-in Seurat cell cycle function, `CellCycleScoring`. This tool compares gene expression in each cell to a list of cell cycle marker genes and scores each barcode based on marker expression. The phase with the highest score is selected for each barcode. Seurat includes a list of cell cycle genes in human single cell data.
+
+```{r convert, echo=TRUE, warning=TRUE}
+cat("Downloading gene homology data from MGI/JAX...\n")
+# Download the data file once and store it in a data frame
+# This file contains ortholog information for various species
+mouse_human_genes <- read.csv("https://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt", sep = "\t")
+
+# separate human and mouse 
+mouse <- split.data.frame(mouse_human_genes,mouse_human_genes$Common.Organism.Name)[[2]]
+human <- split.data.frame(mouse_human_genes,mouse_human_genes$Common.Organism.Name)[[1]]
+
+# remove some columns
+mouse <- mouse[,c(1,4)]
+human <- human[,c(1,4)]
+
+# merge the 2 dataset  (note that the human list is longer than the mouse one)
+mh_data <- merge.data.frame(mouse,human,by = "DB.Class.Key",all.y = TRUE) 
+
+# Modification: Rename the confusing 'Symbol.x' and 'Symbol.y' columns for clarity
+colnames(mh_data) <- c("DB.Class.Key", "mouse_symbol", "human_symbol")
+
+# Verify the structure of the final mapping table
+head(mh_data)
+```
+
+```{r mtohconversion, echo=TRUE, warning=TRUE}
+# Create a new function that uses your local mapping table
+convert_human_to_mouse_local <- function(human_gene_list, mapping_table) {
+  
+  # Find the rows in your mapping table where the human symbol matches your input list
+  found_genes <- mapping_table[mapping_table$human_symbol %in% human_gene_list, ]
+  
+  # From those rows, get the corresponding mouse symbols
+  mouse_orthologs <- found_genes$mouse_symbol
+  
+  # Get the unique, non-missing mouse gene names
+  # na.omit() removes any human genes that didn't have a mouse ortholog
+  unique_mouse_orthologs <- unique(na.omit(mouse_orthologs))
+  
+  # Print a summary to the screen for verification
+  cat("Found", length(unique_mouse_orthologs), "mouse orthologs. The first 6 are:\n")
+  print(head(unique_mouse_orthologs))
+  
+  return(unique_mouse_orthologs)
+}
+```
+
+```{r conversion, echo=TRUE, warning=TRUE}
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+s.genes_mouse <- convert_human_to_mouse_local(cc.genes.updated.2019$s.genes, mh_data)
+g2m.genes_mouse <- convert_human_to_mouse_local(cc.genes.updated.2019$g2m.genes, mh_data)
+```
+
+Once an appropriate gene list has been identified, the CellCycleScoring function can be run.
+
+```{r cellcycle, echo=TRUE, warning=TRUE}
+C19c_norm <- CellCycleScoring(C19c_norm,
+                                         s.features = s.genes_mouse,
+                                         g2m.features = g2m.genes_mouse,
+                                         set.ident = TRUE)
+table(C19c_norm@meta.data$Phase) %>%
+  kable(caption = "Number of Cells in each Cell Cycle Stage",
+        col.names = c("Stage", "Count"),
+        align = "c") %>%
+  kable_styling()
+
+# 1. Calculate the percentage of cells in each phase for each sample
+plot_data <- C19c_norm@meta.data %>%
+  group_by(orig.ident, Phase) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(orig.ident) %>%
+  mutate(percent = n / sum(n) * 100)
+
+# 2. Create the grouped bar plot
+cellscoreplot <- ggplot(plot_data, aes(x = orig.ident, y = percent, fill = Phase)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  # Optional: Add text labels on top of the bars
+  # geom_text(aes(label=round(percent, 1)), vjust=-0.5, position=position_dodge(0.9), size=3) +
+  labs(
+    title = "Cell Cycle Phase Distribution by Sample",
+    x = "Sample",
+    y = "Percentage of Cells (%)",
+    fill = "Cell Cycle Phase"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+cellscoreplot
+png(filename = "./Plots/cellscore.png", height = 1500, width = 3000, res = 300)
+print(cellscoreplot)
+dev.off()
+```
+
+## 3-3. Identify variable genes
+
+The function FindVariableFeatures identifies the most highly variable genes (default 2000 genes) by fitting a line to the relationship of log(variance) and log(mean) using loess smoothing, uses this information to standardize the data, then calculates the variance of the standardized data. This helps avoid selecting genes that only appear variable due to their expression level.
+
+```{r variable3000, echo=TRUE, warning=TRUE}
+C19c_norm <- FindVariableFeatures(
+  C19c_norm,
+  selection.method = "vst",
+  nfeatures = 3000)
+length(VariableFeatures(C19c_norm))
+top20 <- head(VariableFeatures(C19c_norm), 20)
+var.feat.plot <- VariableFeaturePlot(C19c_norm)
+var.feat.plot <- LabelPoints(plot = var.feat.plot, points = top20, repel = TRUE)
+var.feat.plot
+png(filename = "./Plots/variablefeature_3000.png", height = 2000, width = 3000, res = 300)
+print(var.feat.plot)
+dev.off()
+```
+
+## 3-4. Scale the data
+
+The `ScaleData` function scales and centers genes in the dataset. If variables are provided with the “vars.to.regress” argument, they are individually regressed against each gene, and the resulting residuals are then scaled and centered unless otherwise specified. We regress out mitochondrial RNA level (percent.mito) and the number of features (nFeature_RNA) as a proxy for sequencing depth.
+
+```{r scale, echo=TRUE, warning=TRUE}
+C19c_scale <- ScaleData(C19c_norm,
+                        vars.to.regress = c("S.Score", "G2M.Score","percent.mito")
+                        )
+```
+
+## 3-5. Perform dimensionality reduction with PCA
+
+Principal Components Analysis (PCA) is a widely-used dimension reduction method. Each PC is a vector in the reduced-dimensional space that is orthogonal to all preceding PCs. The first of these explains the largest amount of variation and each subsequent PC explains slightly less than the preceding component. PCA is performed on the scaled data, and therefore uses only the variable features.
+
+```{r 3000dimentionality reduction, echo=TRUE, warning=TRUE}
+C19c_3000 <- RunPCA(C19c_scale, verbose = FALSE)
+#Principal component loadings for top genes for the first 2 principal components. The loading can be interpreted as the weights for each original variable when calculating the principal components.
+pca <- DimPlot(C19c_3000,
+        group.by = "orig.ident",
+        reduction = "pca",
+        raster = FALSE,
+        label = TRUE, 
+        repel = TRUE,
+        label.size = 6,
+        shuffle = TRUE)
+pca
+png(filename = "./Plots/C19c_pca_v1.png", height = 3000, width = 3900, res = 300)
+print(pca)
+dev.off()
+
+VizDimLoadings(C19c_3000, dims = 1:2, reduction = "pca")
+#Heatmaps of the top 20 PCs. Cells and features are ordered according to their PCA scores and the 500 most extreme cells are selected to be shown in these plots.
+DimHeatmap(C19c_3000, dims = 1:20, cells = 500, balanced = TRUE)
+#Elbow plot for top principal components. Generally, PCs are used for further analysis which capture the majority of the variation seen in the data (before the elbow which is seen once the standard deviation associated with the PCs becomes small and does not change much between PCx and PCx+1.
+ElbowPlot(C19c_3000, ndims = 50)
+```
+
+## 3-6. Selecting PCs to use
+
+To overcome the extensive technical noise in any single gene, Seurat clusters cells based on their PCA scores, with each PC essentially representing a meta-gene that combines information across a correlated gene set. Determining how many PCs to include downstream is therefore an important step.
+
+We can calculate where the principal components start to elbow by taking the larger value of:
+
+The point where the principal components only contribute 5% of standard deviation and the principal components cumulatively contribute 90% of the standard deviation.
+The point where the percent change in variation between the consecutive PCs is less than 0.1%.
+We will start by calculating the first metric:
+
+```{r 3000firstmetric, echo=TRUE, warning=TRUE}
+pct <- C19c_3000[["pca"]]@stdev / sum(C19c_3000[["pca"]]@stdev) * 100
+# Calculate cumulative percents for each PC
+cumu <- cumsum(pct)
+# Determine which PC exhibits cumulative percent greater than 90% and % variation associated with the PC as less than 5
+co1 <- which(cumu > 90 & pct < 5)[1]
+co1
+```
+The first metric returns PC41 as the PC matching these requirements. Let’s check the second metric, which identifies the PC where the percent change in variation between consecutive PCs is less than 0.1%:
+
+```{r 3000secondmetric, echo=TRUE, warning=TRUE}
+# Determine the difference between variation of PC and subsequent PC
+co2 <- sort(which((pct[1:length(pct) - 1] - pct[2:length(pct)]) > 0.1), decreasing = T)[1] + 1
+# last point where change of % of variation is more than 0.1%.
+co2
+```
+This second metric returns PC18. Usually, we would choose the minimum of these two metrics as the PCs covering the majority of the variation in the data.
+
+```{r 3000minmetric, echo=TRUE, warning=TRUE}
+# Minimum of the two calculation
+pcs <- min(co1, co2)
+pcs
+```
+## 3-7. Construct network & Find clusters
+
+Seurat implements an graph-based clustering approach. Distances between the cells are calculated based on previously identified PCs.
+
+The default method for identifying k-nearest neighbors is annoy, an approximate nearest-neighbor approach that is widely used for high-dimensional analysis in many fields, including single-cell analysis. Extensive community benchmarking has shown that annoy substantially improves the speed and memory requirements of neighbor discovery, with negligible impact to downstream results.
+
+The `FindClusters` function implements the neighbor based clustering procedure, and contains a resolution parameter that sets the granularity of the downstream clustering, with increased values leading to a greater number of clusters. This code produces a series of resolutions for us to investigate and choose from.
+
+Uniform Manifold Approximation and Projection (UMAP) is a dimensionality reduction method that is commonly used in single cell RNA-Seq analysis. Single cell data is extremely high-dimensional; UMAP calculates a nearest neighbor network describing the relationships between cells as measured by the PC loadings of variable genes and creates a low-dimensional space that preserves these relationships.
+
+```{r 3000clustering, echo=TRUE, warning=TRUE}
+C19c_3000 <- FindNeighbors(C19c_3000, dims = 1:18)
+C19c_3000 <- FindClusters(C19c_3000, verbose = TRUE)
+C19c_3000 <- RunUMAP(C19c_3000, dims = 1:18)
+```
+
+```{r observe, echo=TRUE, warning=TRUE}
+umap_v1 <- DimPlot(C19c_3000, reduction = "umap", group.by = "seurat_clusters",
+                   label = TRUE, label.size = 6, repel = TRUE,
+                   pt.size = 0.2, raster = FALSE)
+umap_v1
+png(filename = "./Plots/umap_v1.png", height = 3000, width = 4000, res = 300)
+print(umap_v1)
+dev.off()
+umapsplit <- DimPlot(C19c_3000, reduction = "umap", group.by = "seurat_clusters",
+                     split.by = "orig.ident", label = TRUE, label.size = 6, repel = TRUE,
+                     pt.size = 0.5, ncol = 3,  raster = FALSE)
+umapsplit
+png(filename = "./Plots/umap_split_v1.png", height = 8000, width = 7000, res = 300)
+print(umapsplit)
+dev.off()
+```
+
+![UMAP Result](./Plots/umap_v1.png)
+![UMAP split by sample](./Plots/umap_split_v1.png)
+
+# 4. Prepare for the next section
+
+Doublets are cells that appear to be, but are not, real cells. Depending on the protocols used to barcode single cells/nuclei, doublet rates vary significantly and it can reach as high as 40%. Experimental strategies have been developed to reduce the doublet rate, such as cell hashing, and MULTI-Seq. However, these techniques require extra steps in sample preparation which leads to extra costs and time, and they do not guarantee to remove all doublets. 
+
+In the next session, we will perform doublet detection *in silico* and remove doublets to finalize preprocessing and use the preprocessed data to decide on the optimal number of clusters and cell types.
+
+```{r saveobj, echo=TRUE, warning=TRUE}
+saveRDS(C19c_3000, file = "C19c_3000.rds")
+saveRDS(C19c_norm, file = "C19c_norm.rds")
+saveRDS(mh_data, file = "mouse_human_genesymbol_conversion.rds")
+```
+
+```{r sessioninfo, echo=TRUE, warning=TRUE}
+sessionInfo()
+```
